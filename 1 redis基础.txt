@@ -1,0 +1,962 @@
+1.redis的特性：单线程
+由于是单线程，所以redis的命令执行是串行而不是并行的，意味着同一时间内redis只会执行一个命令。
+
+由于一次只能执行一条命令，所以要拒绝长命令(就是运行时间长的命令)，因为会引起后面的命令阻塞。长命令如：keys,flushall,flushdb,mutil/exec等。
+
+单线程为什么这么快：
+因为redis是纯内纯操作。
+
+
+其实redis不全是单线程，在执行普通读写命令时是单线程，在进行aof持久化时会单独开一个线程进行。
+
+
+2.redis的数据结构
+
+A.字符串类型
+
+字符串的key是字符串，value可以是字符串，数字，二进制，json，但本质上value也还是字符串。
+
+单个value大小不能超过512M，但实际应用中一般不会存超过100K的内容。
+
+
+字符串类型的使用场景：
+缓存
+计数器
+分布式锁
+等等
+
+常用命令：
+get/set/del
+incr/decr/incrby/decrby
+
+实战场景1：
+记录每一个用户的访问次数，或者记录每一个商品的浏览次数。
+方案：键名： userid:pageview 或者 pageview:userid 如pageview:5
+      使用命令：incr
+使用理由：每一个用户访问次数或者商品浏览次数的修改是很频繁的，如果使用mysql这种文件系统频繁修改会造成mysql压力，效率也低。
+而使用redis的好处有二：使用内存，很快；单线程，所以无竞争，数据不会被改乱
+
+实战场景2：
+缓存频繁读取，但是不常修改的信息，如用户信息，视频信息
+方案：
+    业务逻辑上：先从redis读取，有就从redis读取；没有则从mysql读取，并写一份到redis中作为缓存，注意要设置过期时间。
+    键值设计上：一种是直接将用户一条mysql记录做序列化(serialize或json_encode)作为值，userInfo:userid 作为键名如：userInfo:1
+    另一种是以 表名:主键名:字段名:id值 作为键，字段值作为值。如 user:id:name:1 = "zbp"
+    
+实战场景3：
+分布式id生成器
+incr id
+例如，mysql做了分布式，数据分摊到每一个mysql服务器，在插入数据时，每一个mysql服务器的id要自增但却不能相同。此时可以使用redis的incr来完成。原因是，redis是单线程，意味并发请求生成id时，生成的id不会重复。（单线程无竞争）
+
+
+set setnx setxx
+set 不管key是否存在都设置
+setnx key不存在才设置，相当于新增
+set key value xx key存在才设置，相当于修改
+
+
+实战场景4：
+限定某个ip特定时间内的访问次数
+使用 incr + setex
+
+//限定某ip在10秒内访问api的次数不能超过1000次
+$r=new Redis();
+$r->connect($RedisHost,$RedisPort);
+$redis_key = "arts_api|".$_SERVER["REMOTE_ADDR"];
+
+if(!$r->exists($redis_key)){
+    $r->setex($redis_key,10,"1");
+}else{
+    $r->incr($redis_key);
+    
+    //判断是否超过规定次数
+    if($r->get($redis_key)>1000){
+        die("访问过快");
+    }
+    
+}
+
+
+实战场景5:分布式session
+我们知道,session是以文件的形式保存在服务器中的; 如果你的应用做了负载均衡,将网站的项目放在多个服务器上,当用户在服务器A上进行登陆,session文件会写在A服务器;当用户跳转页面时,请求被分配到B服务器上的时候,就找不到这个session文件,用户就要重新登陆
+
+如果想要多个服务器共享一个session,可以将session存放在redis中,redis可以独立与所有负载均衡服务器,也可以放在其中一台负载均衡服务器上;但是所有应用所在的服务器连接的都是同一个redis服务器。
+
+实现如下：
+以PHP为例
+
+方法一:
+
+设置php.ini 文件中的session.save_handle 和session.save_path
+session.save_handler = Redis
+session.save_path =  "tcp://47.94.203.119:6379"     # 大部分情况下,使用的都是远程redis,因为redis要为多个应用服务
+
+如果为redis已经添加了auth权限（requirpass），session.save_path项则应该这样写
+session.save_path =  "tcp://47.94.203.119:6379?persistent=1&database=10&auth=myredisG506"
+
+
+使用redis存储session信息
+/**
+ * 将session存储在redis中
+ */
+session_start();
+echo session_id();
+echo "<br>";
+$_SESSION['age'] = 26;
+$_SESSION['name'] = 'xiaobudiu';
+$_SESSION['sex'] = 'man';
+var_dump($_SESSION);
+
+# 此时session_id依旧存在cookie中。
+
+redis中的key为 PHPREDIS_SESSION:session_id。
+
+当用户跳转页面的时候，php内部会先根据session_id()获取cookie的session_id，再根据session_id获取到redis中的key
+再根据key获取value
+
+所以redis的session是通过cookie中的session_id得知 调用$_SESSION['name']是要获取张三的用户名而不是李四的用户名
+
+如果关闭浏览器,cookie会失效,再打开浏览器的时候,session_id就不见了; 这个时候,虽然redis还保存这张三的session。
+但是php已经无法获取到这个session。
+
+所以张三再登陆的时候，会重新生成一个session。此时张三的session会有两个，一个是正在使用的，一个是已经失效的。失效的session不会一直放在redis中占用内存,php自动给这个redis的可以设置了过期时间。你也可以给session手动设置过期时间,通过ini_set('session.gc_maxlifetime',$lifetime)。（如果是文件的形式存储的session，php会定时清理失效的session文件，失效的session就是在浏览器cookie中找不到session_id的session）
+
+
+封装session类
+class Session
+{
+ 
+    function __construct($lifetime = 3600)
+    {
+        //初始化设置session会话存活时间,如果redis中的key存在超过3600秒,会自动执行session_destory(),具体表现为key被删除
+        ini_set('session.gc_maxlifetime',$lifetime);
+    }
+ 
+    /**
+     * 设置当前会话session的key-value
+     * @param String $name   session name
+     * @param Mixed  $data   session data
+     * @param Int    $expire 有效时间(秒)
+     */
+    function set($name, $data, $expire = 600)   # session中的单独的某个键也可以设置过期时间,很灵活
+    {
+        $session_data = array();
+        $session_data['data'] = $data;
+        $session_data['expire'] = time()+$expire;
+        $_SESSION[$name] = $session_data;
+    }
+ 
+    /**
+     * 读取当前会话session中的key-value
+     * @param  String $name  session name
+     * @return Mixed
+     */
+    function get($name)
+    {
+        if(isset($_SESSION[$name])) {
+            if($_SESSION[$name]['expire'] > time()) {
+                return $_SESSION[$name]['data'];
+            }else{
+                self::clear($name);
+            }
+        }
+        return false;
+    }
+ 
+    /**
+     * 清除当前session会话中的某一key-value
+     * @param  String  $name  session name
+     */
+    function clear($name)
+    {
+        unset($_SESSION[$name]);
+    }
+ 
+    /**
+     * 删除当前session_id对应的session文件（清空当前session会话存储,在redis中的表现为删掉一个session的key,在文件形式session中表现为删除一个session文件）
+     */
+    function destroy()
+    {
+        session_destroy();
+    }
+ 
+}
+
+在一个会话生命周期中,一个redis的key存着这个会话的$_SESSION所有信息包括 $_SESSION['name'],["age"]等
+
+redis存session比文件存session的优势在: 前者可以做分布式session,后者不行;前者是纯内存操作,更快,后者是文件IO操作
+
+我们可以看一下一个key里面的内容
+get PHPREDIS_SESSION:6mmndoqm87st2s75ntlsvbp25q
+
+得到
+"name|a:2:{s:4:\"data\";s:3:\"zbp\";s:6:\"expire\";i:1584351986;}age|a:2:{s:4:\"data\";i:18;s:6:\"expire\";i:1584351986;}job|a:2:{s:4:\"data\";s:10:\"programmer\";s:6:\"expire\";i:1584351986;}"
+
+是一堆序列化的内容
+
+所以这种方式相比于使用hash结构来存的效率更低
+因为这种方式取其中一个字段name就要将整个key获取出来,而且序列化和反序列化也要消耗性能
+
+
+使用前记得调用session_start()
+
+
+
+方法二:使用session_set_save_handler
+<?php 
+
+class Session{
+    private static $redis=null;     # redis是单例redis
+    private static $instance=null;
+    
+    private function __construct($lifetime=3600){
+        $this->lifetime=$lifetime;
+        $this->getRedis();
+        session_set_save_handler(
+            [$this,"open"],
+            [$this,"close"],
+            [$this,"read"],
+            [$this,"write"],
+            [$this,"destory"],
+            [$this,"gc"]
+        );  # 这个要放在session_start之前
+        
+        session_start();
+        
+    }
+    
+    public static function getInstance($lifetime=3600){
+        if(!self::$instance){
+            self::$instance = new self($lifetime=3600);
+        }
+        
+        return self::$instance;
+    }
+    
+    private function getRedis(){
+        if(!self::$redis){
+            self::$redis=new Redis();
+            self::$redis->connect("127.0.0.1",6379);
+        }
+    }
+    
+    # session_start()时自动调用
+    private function open($path,$name){  # php会自动传入文件路径path和文件名,由于这里不是用文件存储而是redis存储,所以不需要用到path和name
+        return true;
+    }
+    
+    # session完成读取或写入时调用
+    public function close(){
+        return true;    # 一定要有返回值,否则报错
+    }
+    
+    public function write($session_id,$data){   # php 会自动将session的键和值做成数组再执行serialize()序列化再传入$data
+        var_dump($data);    
+        if(!self::$redis->exists($session_id)){
+            self::$redis->setex($session_id,$this->lifetime,$data);
+        }else{
+            self::$redis->set($session_id,$data);
+        }
+        
+        return true;    # 一定要有返回值,否则报错
+    }
+    
+    private function read($session_id){  # php自动传入session_id
+        return serialize(self::$redis->get($session_id));   # 一定要返回序列化后的内容,否则报错
+    }
+    
+    # 手动调用session_destory()时调用
+    private function destory($session_id){
+        self::$redis->delete($session_id);
+    }
+    
+    private function gc($maxlifetime){
+        return true;
+    }
+    
+    
+    public function set($name,$value){
+        $_SESSION[$name]=$value;
+    }
+    
+    public function get($name){
+        // return $this->session[$name];
+        return $_SESSION[$name];
+    }
+}
+
+$s=Session::getInstance();
+$s->set("name","213");
+echo $s->get("name");
+
+$s->set("name","zbp");
+echo $s->get("name");
+
+
+# 限制太多,体验太差,不推荐使用
+
+
+总结一下,使用redis存session相比用文件存session的好处:
+1.从文件读写变成内存读写,更快
+2.解决了分布式session的问题(在A服务器无法访问B服务器的session的问题)
+
+
+题外话:在网站分布多台机器的时候,要做session分布式才可以跨机器获取session; 如果我们不用session,改用纯cookie代替session,将用户信息都存到cookie中,这样无论用户访问到哪台机器都无所谓,反正都可以在浏览器中获取用户信息。
+
+但是这真的是一种很好的解决分布式session的方式吗？
+
+本人有时候也会做做爬虫，知道有些页面必须登陆后才能访问，如果将用户信息存在cookie，爬虫完全可以伪造一份用户的cookie来访问用户的隐私页面。所以使用cookie会带来这样的安全问题。
+或者你的cookie是在浏览器可视的，而使用session，只有session_id在浏览器是可视的,用户具体信息在服务端中你是看不到的。
+
+
+mget/mset 批量操作
+
+n次get命令花费的时间 = n次网络时间+n次命令时间
+一次mget命令获取n个key的时间 = 1次网络时间+n次命令时间 
+尤其是客户端(php/Python)和redis服务端不在同一主机上，网络时间就会比较长。
+
+所以尽量用mget，但是mget不要获取太多key，否则要传输的数据过大对网络开销和性能都有负担。
+
+
+B.哈希类型
+一个哈希相当于一条mysql记录
+
+hget/hset/hdel/hgetall
+
+hexists/hlen
+
+hmget/hmset
+
+实战场景1：
+记录每一个用户的访问次数
+方案： 
+键名： user:1:info   字段名：pageview
+使用命令：hincrby
+
+和单纯使用字符串类型进行记录不同，这里可以将用户访问次数也放到用户信息中作为一个整体，user:1:info中还存储着name,email,age之类的信息
+
+
+hgetall/hvals/hkeys
+
+PS:慎用hgetall，因为hgetall会获取一个hash key中的所有字段，这是一个长命令，而redis是单线程，会阻塞住后面的命令的执行。
+
+
+字符串和哈希类型对比：
+将一个用户的信息存为redis字符串和哈希
+字符串存储方式：
+方案1： 键名 user:1:info  值 序列化后的用户对象
+方案2： 键名 user:1:字段名   值 字段值
+
+哈希存储方式：
+方案3： 键名 user:1:info  值 用户数据
+
+方案1的优点是设计简单，可节省内存（相对于方案2），缺点一是如果要修改用户对象中的某个属性要将整个用户对象从redis中取出来，二是要对数据进行序列化和反序列化也会产生一定CPU开销。
+
+方案2的优点是可以单独更新用户的属性，无需将这个用户所有属性取出。
+缺点一是单个用户的数据是分散的不利于管理，二是占用内存，方案1一个用户的数据用一个key就可以保存，方案2一个用户的数据要多个key才可以保存。
+
+方案3的优点：直观，节省空间，可以单独更新hash中的某个属性
+缺点：ttl不好控制
+
+
+C.列表类型
+列表本质是一个有序的，元素可重复的队列
+
+增
+rpush/lpush
+
+rpush c b a   # cba,插入方向<-,即从右往左
+lpush c b a   # abc，插入方向->，从左往右
+
+linsert  # 在一个元素前或后插入元素
+
+删
+lpop/rpop   #弹出
+lrem        #删除
+ltrim   # 修剪列表返回一个子列表，会影响原列表
+
+查
+lrange  # 按照范围查询列表返回一个子列表
+lindex  # 按索引取
+llen    # 列表长度
+
+改
+lset    # 修改某索引的值为新值
+
+
+实战场景1：
+微博中的时间轴功能（文章按时间排序，还可以做分页）
+方案：做一个列表用于存放某个用户的所有微博id，key为 weiboList:user:1,值为微博id。
+做一个哈希，里面放微博的内容
+
+该用户新增一个微博就会忘列表中lpop一个微博id，查询的时候使用lrange即可，分页也可以使用lrange。
+
+
+blpop/brpop     # 是lpop和rpop的阻塞版
+当列表长度不为空是，lpop和blpop效果一样。
+当列表长度为空，lpop会立刻返回nil，而blpop会等待，直到有元素进入列表，blpop就会执行弹出。
+它的应用场景就是消息队列。
+
+
+小结：
+用列表实现栈：lpush+lpop = stack
+用列表实现队列：lpush+rpop = queue
+用列表实现固定集合: lpush+ltrim = capped collection
+用列表实现消息队列：lpush+brpop = message queue
+
+
+D.集合类型
+集合的特点是无序性和确定性（不重复）。
+
+增
+sadd
+
+删 
+srem
+
+scard #个数
+sismember   #是否存在
+srandmember # 随机选n个元素
+spop    # 随机弹出元素，影响原集合
+smembers    # 返回所有元素，要慎用，不要获取内容较大的集合
+
+
+实战场景1：
+抽奖
+
+使用spop即可，利用的是它的无序性和不重复
+
+
+实战场景2：
+赞，踩，收藏功能等。
+方案： 每一个用户做一个收藏的集合，每个收藏的集合存放用户收藏过的文章id或者商品id。
+
+键名： set:userCol:用户id
+值：   文章id
+
+如果使用mysql实现，需要建立多对多关系，要建中间表。
+
+实战场景3：
+给文章添加标签
+方案： 
+要创建两种集合，以文章id为键名放标签的集合，以标签id为键名放文章的集合。
+创建两种集合是因为我们会查询某标签下有什么文章，也会查询某文章下有什么标签
+
+键名： article:1:tags    值：tag的id
+键名： tag:1:users        值：user的id
+
+而且这两个集合创建时要放在一个事务中进行。
+
+
+
+sdiff/sinter/sunion     # 交集并集差集
+
+实战场景4：
+共同好友
+
+
+
+E.有序集合
+有序集合的特点是 有序，无重复值
+
+zadd key score element
+
+zrem
+
+zscore      # 获取分数
+
+zincrby     # 增加减少分数
+
+zcard       # 元素个数
+
+zrange      # 按下标范围获取元素，加上withscores会按分数排序
+
+zrangebyscore   # 按照分数范围获取元素
+
+zcount      # 按分数范围计算元素个数
+
+zremrangebyrank     # 删除指定下标范围的元素
+
+zremrangebyscore
+
+
+实战场景：
+排行榜
+
+
+
+
+最后强调一下，要慎用hgetall，原因如下：
+当一个hash的字段数很多，存储的内容很多时，处理hgetall请求会花费较长时间；而redis是单线程，同一时间只能处理一个操作，所以后面的操作都要等待hgetall处理完毕才能处理，很影响效率和性能。
+
+还有一种情况：列表或者集合中存了很多哈希的键名。
+通过 lrange 0 -1 或者 smembers 这样的命令取出列表或者集合中所有键名再通过hgetall取出大量的hash，而每个hash中又有大量的字段。这种情况下性能会急剧下降，而且占用大量内存，甚至会造成宕机。
+
+
+下面总结时间复杂度为n的命令：
+String类型
+MSET、MSETNX、MGET
+
+List类型
+LPUSH、RPUSH、LRANGE、LINDEX、LSET、LINSERT
+LINDEX、LSET、LINSERT 这三个命令谨慎使用
+
+Hash类型
+HDEL、HGETALL、HKEYS/HVALS
+HGETALL、HKEYS/HVALS 谨慎使用
+
+Set类型
+SADD、SREM、SRANDMEMBER、SPOP、
+SMEMBERS、SUNION/SUNIONSTORE、SINTER/SINTERSTORE、SDIFF/SDIFFSTORE
+第二行命令谨慎使用
+
+Sorted Set类型
+ZADD、ZREM、
+ZRANGE/ZREVRANGE、ZRANGEBYSCORE/ZREVRANGEBYSCORE、ZREMRANGEBYRANK/ZREMRANGEBYSCORE
+第二行时间复杂度 O(log(N)+M)，需要谨慎使用
+
+其他常用命令
+DEL、KEYS
+KEYS 谨慎使用
+
+基本上，设置多个值或者获取多个值的命令其时间复杂度为n
+时间复杂度越高，执行命令消耗的时间越长。
+
+
+
+3.慢查询
+就是将查询时间长的操作记录下来。
+
+客户端请求的生命周期：
+如上图所示可以分为4个阶段：
+a.发送命令（消耗的是网络时间）
+b.命令在队列中排队等待被执行（因为redis单线程，同一时间只能处理一个命令）
+c.执行命令
+d.返回结果（消耗网络时间）
+
+说明：
+慢查询发生在第三阶段,也就是说慢查询算的时间是第三阶段的时间，第三阶段执行操作所花的时间超过规定时间就会记录到慢查询中。
+
+客户端超时不一定是因为慢查询（执行操作时间过长），还可能是因为命令排队耗时或者网络传输耗时。
+但慢查询是客户端超时的一个可能因素。
+
+
+每一个慢查询会被放入一个固定长度的先进先出的队列，而且慢查询的结果是保存到内存中，不会进行持久化的（重启清空）。
+当一个查询被redis认定为是慢查询，那么该查询会被放入这个队列，当队列的长度满了之后，先进入的慢查询会被弹出。
+
+两个有关慢查询的配置：
+slowlog-max-len     # 慢查询队列长度，默认128
+slowlog-log-slower-than     # 执行多长时间认定为慢查询，默认10000，单位微秒。（即10ms）
+
+slowlog-log-slower-than=0    把所有操作都当成慢查询
+slowlog-log-slower-than=-1   不记录任何慢查询
+
+
+可以使用 config  set来动态设置这两个参数，因为redis开启之后不建议进行重启，所以不推荐通过修改配置文件的方式修改。
+config set slowlog-max-len 128
+
+
+
+慢查询命令
+
+由于慢查询是写入到内存中，所以可以通过命令获取慢查询
+
+slowlog get [n]     # 获取n条慢查询
+slowlog len         # 获取共有几个慢查询
+slowlog reset       # 清空慢查询
+
+
+
+运维经验：
+a. slowlog-max-len不要设置过大，默认10ms，通常设置为1ms
+原因：redis的QPS一般是万级别的，所以每条请求处理时间平均为0.1ms。所以设1ms为慢查询时间比较合适。
+但是还是要根据实际情况，一般是根据你服务端redis的QPS而定。
+
+b. slowlog-log-slower-than 不要设置过小，默认128，通常设为1000
+
+c. 理解命令生命周期
+
+d. 定期持久化慢查询
+由于慢查询是存到内存中，所以重启redis会情况慢查询队列；而且慢查询数量超过队列的长度后，旧的慢查询会被弹出销毁。可以通过写脚本调用slowlog get 将慢查询写入到mysql进行长久保存。
+
+
+
+4.pipeline (流水线)
+流水线是能够帮助客户端将多条命令打包一起发送给服务端的工具。
+
+情景1：
+客户端如果想获取或者设置多个key，可以发送多次get,set命令。
+但是每次命令从客户端传到redis服务端都要消耗网络时间。发送n次会消耗n次网络时间。
+客户端等待的时间 = n次网络时间+n次命令时间(包括命令排队时间和执行时间)
+
+解决方法：使用mget或者mset，只发送了一次命令
+客户端等待的时间 = 1次网络时间+n次命令时间(包括命令排队时间和执行时间)
+
+
+情景2：
+客户端要执行多个命令，如hget,get,set,lpush这四个命令。此时无法向mget一样用一条命令代替多条命令。
+所以
+客户端等待的时间 = n次网络时间+n次命令时间(包括命令排队时间和执行时间)
+
+解决方法：使用pipeline，可以将上述4条命令打包并一次性发送给服务端批量处理。
+客户端等待的时间 = 1次网络时间+n次命令时间(包括命令排队时间和执行时间)
+
+
+这就是pipeline的应用场景。
+
+注意点：
+a.使用redis时，网络会成为redis的一个瓶颈
+redis的处理速度是微秒级别，而网络传输的速度是毫秒级别，远远慢于redis的处理速度。所以在使用redis时，网络速度会成为redis的一个瓶颈，节省网络传输的时间得到的收益会远高于节省命令执行时间的收益。
+这也凸显出pipeline的重要性。
+
+b.M操作是原子性的，而pipeline不是原子性的。
+mget在等待队列和执行命令是作为一个命令来执行。
+而pipline中打包的命令不会作为一个命令一次性执行，而拆分回原来n个命令一一执行
+
+c.pipeline每次携带的命令数量不能太多，如果有很多命令，可以使用多个pipeline传输。
+如 10000个命令，可以使用10个pipeline分批传输。
+
+d.pipline每次只能作用于一个redis节点
+
+
+pipeline如何使用，每个客户端都不同。这里贴出Python使用pipeline的方式：
+
+import redis 
+r = redis.Redis("127.0.0.1",6379)
+pipe = r.pipeline()
+pipe.set("name","zbp")
+pipe.get("name")
+res = pipe.execute()
+print(res)
+
+返回的结果是一个列表，元素是每一条redis命令的返回值
+
+
+
+
+5.发布订阅
+角色： 发布者  订阅者  频道
+
+发布订阅的通信模型：
+发布者和订阅者都在客户端，而频道在redis服务端。
+发布者发布消息到redis服务器，频道会将消息广播到关注了这个频道的所有订阅者。
+
+命令 
+publish channel message     # 发布消息，返回订阅者个数
+subscribe channel   # 订阅，可以接多个channel
+unsubscribe channel     # 取消订阅，可以接多个channel
+
+
+对比消息队列和发布订阅：
+二者的共同点是：消息发布者和订阅者都在客户端，频道或者队列在服务端。
+不同点：发布订阅会将消息发给所有订阅者，但是消息队列则只有一个订阅者能接收到(或者说是抢到)队列弹出来的元素。
+
+所以消息队列除了能用来缓解请求压力之外，还能够实现一个"抢"的功能，例如实现抢红包功能。不过消息队列用来处理并发请求用的是阻塞的brpop命令，而实现抢红包应该是列表中已经有红包，直接使用rpop就好。
+
+注意，订阅者只可以接收到订阅之后的消息，订阅之前频道发的消息是接收不到的。
+
+
+Python演示：
+订阅者 subscriber.py
+
+# coding=utf-8
+
+import redis
+import time
+
+r = redis.Redis("127.0.0.1",6379)
+p = r.pubsub()  # 创建一个PubSub 发布订阅对象
+
+p.subscribe("test_channel")   # 订阅一个频道
+
+while True:
+    # 接收消息
+    data = p.get_message()
+    if data:
+        print(data)
+    time.sleep(0.1)
+
+
+# 或者使用p.listen()，listen()会返回一个生成器，可以遍历这个生成器来获取消息，当频道没有消息的时候，listen会阻塞循环；当有消息时，会接收消息
+#for message in p.listen():
+#    print(message)
+  
+
+  
+发布者 publisher.py
+# coding=utf-8
+
+import redis
+
+r = redis.Redis("127.0.0.1",6379)
+res = r.publish("test_channel","This is test data");
+
+print(res)
+
+
+订阅者先订阅
+python subscriber.py 
+
+发布者再发布
+python publisher.py
+
+
+
+注意:当客户端订阅了一个频道,这个客户端脚本就会一直处于一个阻塞的运行状态。如果想要结束脚本就要调用 unsubscribe 取消订阅
+# coding=utf-8
+
+import redis
+import time
+
+r = redis.Redis("127.0.0.1",7000)
+p = r.pubsub()  # 创建一个PubSub 发布订阅对象
+
+p.subscribe("test_channel")   # 订阅一个频道
+
+count = 0
+for message in p.listen():
+    count+=1
+    print(message)
+    if count>5:
+        p.unsubscribe("test_channel")
+
+
+
+如果是用php来订阅消息,取消订阅后脚本还无法结束运行,此时要die强行终止才行
+<?php 
+    set_time_limit(0);
+    $r = new Redis();
+    $r->connect("127.0.0.1",7000);
+    $r->subscribe(['test'],"cb");
+    function cb($redis,$channel,$msg){
+        var_dump($msg);
+        $redis->unsubscribe(["test"]);
+        die;
+    }
+?>
+
+
+6.bitmap位图
+我们知道一个字符占1个字节，也就是8个位
+
+例如 
+
+set name big
+
+big字符串中的3个字符的ASCII码为98 105 113
+所以big转为二进制就是： 
+01100010|01101001|01100111
+    b       i        g
+    
+占了3个字节的大小，一共24个位。
+
+bitmap位图可以帮我们获取和设置key存储的值的位。
+
+例如 
+获取 name 这个key 的第一个位
+getbit name 0   # 得到0
+
+设置 name 这个key的第8个位为1
+setbit name 7 1     
+get name        # 得到cig,b变成c
+
+setbit只能修改位图指定索引的值，要么是0要么是1
+
+如果使用setbit设置一个不存在的key的位图，则会生成这个key，并且将偏移量之前的位自动补0
+例如：
+setbit newKey 99 1     # 生成一个newKey，其位图长度为100，第100个位的值为1
+
+位图为： 000...001
+         | 99个0 |
+         
+get newKey      # 会得到一堆你不认识的数字"\x00\x00\x00\x00\x80"
+
+
+bitcount key [start end]   # 获取指定索引范围内位为1的个数
+PS：这里的 start end 指定的索引范围是字节索引而不是为索引。
+
+例如： 
+有一个位图testbit的值为：
+11010101 10011100
+
+这里有2个字节，8个位。
+bitcount testbit 0 0    # 获取第一个字节的位为1的个数
+得到 5 
+
+bitcount testbit 0 1   # 获取第一第二个字节的1 的个数
+
+
+bitop option destkey key1 key2 ... keyn      # 将多个bitmap进行 and or not xor操作并将结果存到destkey中
+
+这里题外话说一下位运算：
+and: 0&0=0  0&1=0  1&0=0  1&1=1
+or： 0|0=0  0|1=1  1|0=1  1|1=1
+xor: 0^0=0  0^1=1  1^0=1  1^1=0
+
+
+实战场景：
+大量的独立用户统计，具体情境为，一个网站有1亿个注册用户，每天登陆的用户有5000万个独立用户。记录每天每一个用户是否登陆。
+
+两种解决思路：
+a.使用集合set：以日期为key，集合存放的是当天登陆的用户id。
+
+sadd date:20190101 100 5019 43889104    # 2019-01-01这天存了id为100,5019和43889104的id
+
+假如每个userid平均占用空间为32个位=4字节，则一天约有5000万个id被记录到一个集合中，所以一天占用的内存空间=4*5000万 = 200M
+
+一个月会产生30个这样的集合（这30个key不会都放到内存，肯定是只有当天的key放到内存，之前的key写入磁盘文件中），会占用
+30 * 200M = 6G 的空间
+
+如果想统计连续登录一周的用户可以
+sinter date:20190101 date:20190102 ... date:20190107
+
+b.使用位图： 以日期为key，设置位图的长度为最大的userid，假设最大的userid刚好是100000000（1亿），所以这个key一共有1亿个位。
+
+00101100...01101
+|<- 一亿个位 ->|
+
+一天占用的空间为 1亿/8 = 12.5M
+
+具体命令：
+setbit date:20190101 100000000 0    # 先设定位图长度为1亿
+setbit date:20190101 549 1          # 如userid为549的用户登录，就在第549个位上设置为1。
+setbit date:20190101 98445219 1
+.....
+
+这样每个userid占用的空间实际上只有1个位=1/8个字节。
+
+但是不管当天只有1个用户登录还是有1亿个用户登录，生成的位图的长度都是固定的1亿，占用的空间都是固定的12.5M。
+
+一个月下来占用 
+12.5*30 = 375M
+
+如果想统计连续登录一周的用户可以
+bitop and date:20190101 date:20190102 ... date:20190107
+
+如果想统计一天的独立用户登录数量
+bitcount date:20190101
+
+
+如果想获取id为1000的用户在某一天是否登录：
+getbit date:20190101 1000
+
+
+对比set和bitmap发现，后者会节省很多空间。
+
+
+
+但是换一个情景：
+1亿的用户，每天10万独立用户登录
+
+使用set : 32/8 * 10万 = 4M
+使用bitmap: 1亿/8 = 12.5M 
+
+此时是使用set更节省空间。
+
+
+
+7.HyperLogLog
+基于Hyperloglog算法，可以以极小的空间完成独立数据统计。其本质还是字符串。
+
+命令：
+pfadd key element ...   # 向hyperloglog添加一个或多个元素
+pfcount key ...     # 计算hyperloglog的不重复的元素总数
+pfmerge destkey k1 k2 ...   # 合并多个hyperloglog赋给destkey
+
+
+实战场景：
+计算每一天的网站的独立访客数量（用户重复进入网站不算）
+方案：使用hyperloglog，以日期为key，一天建立一个hyperloglog来记录独立访客。用户每访问一次网页就往里面添加用户的id。可以往这个key中添加重复的用户id，但是pfcount只会计算不重复值的个数。
+
+添加
+pfadd date:20200101 u1 u100 u439 ...
+
+计算一天的独立访客数
+pfcount date:20200101
+
+计算一周的独立访客数
+pfcount date:20200101 date:20200102 ... date:20200107
+
+如果一天有100万的独立用户访问网站，则一个hyperloglog只消耗15K的内存，一个月450K，一年才5M。
+
+
+
+hyperloglog与set、bitmap的区别和比较：
+hyperloglog消耗内存极小，但是它只能计算key中独立元素个数，不能取出里面的元素或者查看key中是否有某个元素。
+
+所以想获取某个用户在某一天是否登陆就办不到的，而set和bitmap都是可以办到的。
+
+hyperloglog有一定的错误率，例如往pfadd添加100万个不同元素（请勿用一条pfadd添加100万个元素），上面计算出来的元素个数为1009839
+
+相比于单纯的字符串型 incr 来计算用户访问的区别是：
+两者都先用很小的空间但
+incr 不能计算独立用户访问数，只能计算用户总访问数（包括刷新页面也计算在内）,而hyperloglog可以。
+
+
+
+8. GEO
+用于存储和计算地理位置
+
+geoadd key 经度 纬度 地点名 [经度 纬度 地点名] ...
+# 地点名可以自定义，如 老碗会南山分店
+
+geopos key 地点名  # 获取经纬度信息，会很精确
+
+geodist key 地名1 地名2 [unit]    # 获取两个地理位置的距离，unit为单位 m/km/mi/ft
+
+georadius  # 用于计算指定位置范围内的地点名，命令比较复杂，请查手册
+
+
+
+实战场景：
+美团外卖获取附近的美食
+
+
+PS：
+本质上geo是一个zset的类型，geo没有提供删除地点名的功能，所以如果想删除一个地点名，可以使用zrem key 地名来删除geo的地名
+
+
+
+
+
+
+
+
+查看redis占用了多少内存：
+redis-cli下执行 info memory
+
+查看共有几个key
+dbsize
+
+
+
+关于如何使用redis做消息通知,例如微博中有A,B,C,D四个用户关注了S用户
+当S用户发微博的时候,A,B,C,D如果在线就能接收到这个消息,并即使查看S发的新微博
+
+涉及到的问题:
+1.A~D可能不只关注了S一个用户,还关注了其他用户,所以当其他用户发消息的时候,A~D也能接受到其他用户的通知
+2.S发出通知,如果A查看了这条通知,新消息提示的红点就会消失,但B~D没看这条通知这个红点不能消失,如何解决A~D显示通知的区别性
+3.通知中要包含 "谁发的","发的时间"和"发的主题" 这样的信息
+4.实时显示通知和非实时显示通知该怎么做
+
+非实时显示(即刷新才能看到新消息)的思路:
+将S发布的微博的部分信息存入hash,存入的内容为 "标题","时间","发布者",键名为 msg:uid:timestamp 如 msg:8:1583953302 表示这个消息是id为8的用户在这个时间戳时发的消息
+每一个用户都有一个set存放其粉丝的id,key为 fan:uid,例如 fan:8 存放的是id为8的所有粉丝的id
+每一个用户有一个zset存放消息的key,权重是消息发布的时间,其key为notice:uid,如 notice:10 表示id为10的消息集合,存的值为 权重是"1583953302",值是msg:8:1583953302
+每一个用户有一个string类型的key,用来保存上一次查看消息的时间戳,key为 viewNotice:uid
+
+过程: S发布微博,并创建 msg:S:timestamp, 获取 fan:S 的所有粉丝的id, 并将"msg:S:timestamp"存入到 notice:A~D 中.
+当 A 刷新页面时,会从 notice:A 中获取权重大于 viewNotice:A 的集合元素
+如果获取的元素个数为0说明没有新消息,否则就是有。
+通过获取到的hash键名获取通知的具体信息
+展现新消息时，可以通过权重排序
+当查看了新消息之后,更新 viewNotice:A 中的值
+
+可以变动的地方：
+可以不将微博信息存入redis，而是存入mysql。这样，显示提示是通过redis实现的，获取信息内容则从mysql中获取。也可以同时存在redis和mysql中，存在redis中的hash要设置过期时间，超过了过期时间即使还有部分粉丝没有查看消息也会销毁该hash。这部分粉丝从mysql也可以查看新消息(通过发布者id和时间戳为条件查询mysql)
+可以不记录粉丝最近一次查看新消息的时间，但是这样就需要在查看新消息后将zset中的元素清空
+
+
+
+实时显示的思路:
+在非实时显示的基础上使用长连接

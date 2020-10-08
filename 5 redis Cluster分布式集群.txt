@@ -1,0 +1,752 @@
+所谓的分布式集群就是：加机器，所有的数据分散的存放到每一台机器
+
+redis Cluster是redis内部提供的一种分布式集群功能
+
+为什么需要分布式集群
+1.并发量
+单机的redis的性能可以达到QPS每秒10万
+但是更大的并发量需要分布式集群分散redis请求
+
+2.数据量（扩容）
+一个正常的企业级应用所在的单台机器其内存在16G~256G间
+如果需要将大量数据都存在内存，就需要更多机器进行扩容
+
+
+分区规则：
+最常见的就是顺序分区（即范围分区 1~100中1~33放第一个分区，34~66第二个分区，67~100第三个分区）和哈希分区（类似于取模）
+
+对比：
+哈希分布：数据分散度高，键值分布业务无关，无法顺序访问，支持批量操作
+顺序分布：数据分散度易倾斜，键值业务相关，可顺序访问
+
+
+redis cluster属于哈希分片（分布）
+
+哈希分布主要有三种方式：
+节点取余分区
+对key进行hash()处理后的结果对节点数取余数决定其所在的节点
+优势：简单明了
+劣势：扩容时会导致大批量的数据迁移问题（节点数从3变为4，id为3的数据要从节点1迁移到节点3）。
+
+如果真的要扩容建议翻倍扩容，可以减少迁移量
+
+不建议使用取余分区
+
+
+一致性哈希分区
+是对取余算法的一个优化。它将数据范围看成一个token环，对key进行hash处理的值会落在环上，每一个key会存储在离环上最近的那个节点。
+优势：当进行扩容时，只会有少量的数据的迁移。尤其是当节点数比较大的时候，迁移的数据量占比会越少
+劣势：可能会导致负载不均衡，新加的节点的流量会比较少
+
+
+虚拟槽分区
+redis cluster就是使用这种算法
+每一个redis节点会被分配一个槽范围，每一个槽范围对应着一个数字范围。总的范围默认是0~16383
+
+如果有五个节点，每个节点分配一个槽范围，第一个节点的槽范围是0~3275，第二个节点是3276~6553,.....
+
+查找或写入数据时，键值key进行hash运算得到的hash值对16383取余得到的数就是这个key所在的槽,根据槽的位置得到节点位置。
+
+=======================================
+
+redis cluster的基本架构
+1.多节点
+
+2.meet
+每一个集群节点都是互相通信的（通过meet操作），这样每一台节点就可以知道其他所有节点的槽范围,使得客户端对一个不包含目标key的节点发送请求也能从其他节点获取到key(通过moved和ask重定向)
+
+3.指派槽
+需要给每一个节点指定一个槽范围
+
+4.复制
+节点总数是偶数，一半是从节点一般是主节点
+
+redis cluster的安装
+两种方法: 原生命令安装和官方工具安装(ruby)
+
+原生命令安装：
+1.配置启动redis
+port 6379
+daemonize yes
+dir /tmp/redis
+dbfilename dump-6379.conf
+logfile 6379.log 
+cluster-enabled yes    # 表示该节点是集群节点
+cluster-config-file nodes-6379.conf     # 指定集群节点配置文件
+cluster-node-timeout 15000  # 节点主观下线的超时时间，使用默认值就好
+cluster-require-full-coverage no   # 如果有一台节点挂掉，整个集群的节点就不提供服务，默认yes，要改为no
+
+# 开启所有集群节点
+redis-server redis-6379.conf 
+redis-server redis-6380.conf 
+redis-server redis-6381.conf 
+redis-server redis-6382.conf 
+redis-server redis-6383.conf 
+redis-server redis-6384.conf 
+
+这里做实验所以所有节点都放一台机器上。真实项目中是一台机器放一个redis节点。
+
+这里六台节点，三主三从
+
+2.meet操作让所有节点相互通信
+redis-cli -p 6379 cluster meet 127.0.0.1 6380
+redis-cli -p 6379 cluster meet 127.0.0.1 6381
+redis-cli -p 6379 cluster meet 127.0.0.1 6382
+redis-cli -p 6379 cluster meet 127.0.0.1 6383
+redis-cli -p 6379 cluster meet 127.0.0.1 6384
+
+只要让一台节点meet其他节点，那么其他所有节点之间都能互相通信（6379可与6382通信，6381可与6384通信）
+
+3.为每一个主节点分配槽
+redis-cli -p 6379 cluster addslots slot {0...5461}
+redis-cli -p 6380 cluster addslots slot {5462...10922}
+redis-cli -p 6381 cluster addslots slot {10923...16383}
+
+4.设置主从
+redis-cli -p 6382 cluster replicate ${node-id-6379}     # 主为6379,从为6382
+redis-cli -p 6383 cluster replicate ${node-id-6380}
+redis-cli -p 6384 cluster replicate ${node-id-6381}
+
+${node-id-6381}是6381的node-id，node-id是 cluster nodes 命令执行结果的第一列
+
+原生命令主要是为了让我们了解redis cluster的一个原理和过程。实际生产中，会使用官方提供的ruby实现。
+==========================================
+
+实验开始：
+4个集群节点：
+主：127.0.0.1 7000
+主：127.0.0.1 7001
+从：127.0.0.1 7002
+从：127.0.0.1 7003
+
+配置内容如下：
+port 7000
+daemonize yes
+logfile "7000.log"
+pidfile "redis_7000.pid"
+dir "/usr/local/redis/test"
+cluster-enabled yes
+cluster-config-file nodes-7000.conf
+cluster-require-full-coverage no
+
+
+1.开启节点
+redis-server ./redis-7000.conf
+redis-server ./redis-7001.conf
+redis-server ./redis-7002.conf
+redis-server ./redis-7003.conf
+
+查看redis节点的集群情况
+redis-cli -p 7000 cluster nodes
+结果
+3866c0186d88b0c785281b49010169ba76ffc7db :7000@17000 myself,master - 0 0 0 connected 5798
+
+由于还没有进行meet操作所以只有一条数据。
+
+
+redis-cli -p 7000 cluster info
+结果
+cluster_state:ok            # 集群状态    
+cluster_slots_assigned:1    # 集群总体被分配的槽的总个数
+cluster_slots_ok:1
+cluster_slots_pfail:0
+cluster_slots_fail:0
+cluster_known_nodes:1   # 连通的集群个数，由于未meet，所以为1
+cluster_size:1      # 集群节点个数
+cluster_current_epoch:0
+cluster_my_epoch:0
+cluster_stats_messages_sent:0
+cluster_stats_messages_received:0
+
+
+此时尝试在其中一台集群中写入数据
+
+
+2.meet操作 
+redis-cli -p 7000 cluster meet 127.0.0.1 7001
+redis-cli -p 7000 cluster meet 127.0.0.1 7002
+redis-cli -p 7000 cluster meet 127.0.0.1 7003
+
+查看redis节点的集群情况
+redis-cli -p 7000 cluster nodes
+
+结果
+fef85a301c532f30828246e324dfc43f40655c99 127.0.0.1:7003@17003 slave 3866c0186d88b0c785281b49010169ba76ffc7db 0 1582969747224 1 connected
+3866c0186d88b0c785281b49010169ba76ffc7db 127.0.0.1:7000@17000 myself,master - 0 1582969747000 1 connected 5798
+42b52e00f7f2387d881ee794e2558ac92d3d27e8 127.0.0.1:7001@17001 slave 3866c0186d88b0c785281b49010169ba76ffc7db 0 1582969748000 1 connected
+a044f31e35f8e32334a5fee4faeaa88fcbe8d041 127.0.0.1:7002@17002 slave 3866c0186d88b0c785281b49010169ba76ffc7db 0 1582969748227 1 connected
+
+
+3.为主节点分配槽范围
+要写一个脚本来完成
+
+addslots.sh如下
+
+#!/bash/sh
+
+start=$1
+end=$2
+port=$3
+
+
+for slot in `seq ${start} ${end}`
+do
+        echo "slot:${slot}"
+        redis-cli -p ${port} cluster addslots ${slot}
+done
+
+
+#我们只需要对主节点分配槽
+sh addslots.sh 0 8191 7000
+sh addslots.sh 8192 16383 7001
+
+
+#分配槽范围完毕，查看分配情况：
+redis-cli -p 7001 cluster nodes
+
+结果
+fef85a301c532f30828246e324dfc43f40655c99 127.0.0.1:7003@17003 slave 3866c0186d88b0c785281b49010169ba76ffc7db 0 1582970971368 1 connected
+42b52e00f7f2387d881ee794e2558ac92d3d27e8 127.0.0.1:7001@17001 myself,slave 3866c0186d88b0c785281b49010169ba76ffc7db 0 1582970971000 0 connected 8192-16383
+a044f31e35f8e32334a5fee4faeaa88fcbe8d041 127.0.0.1:7002@17002 slave 3866c0186d88b0c785281b49010169ba76ffc7db 0 1582970973374 1 connected
+3866c0186d88b0c785281b49010169ba76ffc7db 127.0.0.1:7000@17000 master - 0 1582970972371 1 connected 0-8191
+
+注意第二行有一个 8192-16383
+第四行有一个 0-8191
+表示 7001和7000 分配的槽的范围
+
+
+redis-cli -p 7001 cluster info
+
+结果
+cluster_state:ok
+cluster_slots_assigned:16384        # 集群的总的槽数
+cluster_slots_ok:16384
+cluster_slots_pfail:0
+cluster_slots_fail:0
+cluster_known_nodes:4
+cluster_size:1
+cluster_current_epoch:1
+cluster_my_epoch:1
+cluster_stats_messages_ping_sent:1554
+cluster_stats_messages_pong_sent:1528
+cluster_stats_messages_meet_sent:1
+cluster_stats_messages_sent:3083
+cluster_stats_messages_ping_received:1526
+cluster_stats_messages_pong_received:1555
+cluster_stats_messages_meet_received:2
+cluster_stats_messages_update_received:1
+cluster_stats_messages_received:3084
+
+
+
+4.集群主从复制
+作者执行：
+redis-cli -p 7002 cluster replicate 3866c0186d88b0c785281b49010169ba76ffc7db    # 最后一列这是 7000的node id 
+redis-cli -p 7003 cluster replicate fef85a301c532f30828246e324dfc43f40655c99    # 这是 7001的node id 
+
+redis-cli -p 7001 cluster nodes
+
+
+但是其实在 meet 那一步的时候，主从关系就已经建立好了。7000是主，7001~7003都是从。
+所以这里想让7003同步7001也就办不到了。可能新版本redis是这样的。
+
+
+
+=============================================
+
+ruby构建redis cluster 集群 
+
+ruby下载 http://www.ruby-lang.org/zh_cn/downloads/
+
+下载安装包后：
+./configure --prefix=/usr/local/ruby
+make && make install
+
+ruby -v 可以查看ruby的版本
+
+由于系统本身自带了ruby，所以要将新安装的ruby命令覆盖原本的ruby
+cp /usr/local/ruby/bin/ruby /usr/local/bin
+cp /usr/local/ruby/bin/ruby /usr/bin
+
+安装rubygem redis 这是ruby的redis客户端
+wget https://rubygems.org/downloads/redis-4.1.3.gem   # redis的gem版本可以在https://rubygems.org中查看
+gem install -l redis-4.1.3.gem
+
+如果没有gem命令则 yum install -y gem
+
+
+
+安装redis-trib.rb,这是redis官方的一个用于搭建redis集群工具，是基于ruby的
+# 从redis安装包目录中复制redis-trib.rb文件即可
+cd ~/redis.5.0.7 && cp redis-trib.rb /usr/local/redis/bin/
+
+
+
+接下来使用 redis-trib.rb 进行redis cluster部署
+1.先启动所有节点（请先删除rdb文件再重启）
+redis-server ./redis-7000.conf
+redis-server ./redis-7001.conf
+redis-server ./redis-7002.conf
+redis-server ./redis-7003.conf
+redis-server ./redis-7004.conf
+redis-server ./redis-7005.conf
+
+2.部署集群
+redis-trib.rb create --replicas 1 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005
+
+其中 --replicas 1 表示每一个集群中的主节点都有一个从节点，此时会自动将7002作为7000的从节点，7003作为7001的从节点
+
+他会自动进行集群节点的meet操作和分配槽
+
+但是在新版本的redis中，redis-cli本身就支持一步建立redis cluster部署，无需安装redis-trib。在redis 5.0.7 中，redis-trib已经废弃。
+
+而且redis cluster的搭建至少要有3台主节点，所以要至少部署6台节点
+
+2. 部署集群（修改）
+redis-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005 --cluster-replicas 1
+
+信息如下
+Master[0] -> Slots 0 - 5460         #主节点的槽范围
+Master[1] -> Slots 5461 - 10922
+Master[2] -> Slots 10923 - 16383
+Adding replica 127.0.0.1:7004 to 127.0.0.1:7000     # 集群主从复制信息
+Adding replica 127.0.0.1:7005 to 127.0.0.1:7001
+Adding replica 127.0.0.1:7003 to 127.0.0.1:7002
+>>> Trying to optimize slaves allocation for anti-affinity
+[WARNING] Some slaves are in the same host as their master
+M: 422f7a809e464bc9fab3ef535394e3eacf0f4a67 127.0.0.1:7000      # node-id 节点ip和port 槽范围 是主/从节点
+   slots:[0-5460] (5461 slots) master
+M: 81c66987868397428ffde697e9f5b1cdf9989bc5 127.0.0.1:7001
+   slots:[5461-10922] (5462 slots) master
+M: 2de72ccddcd0d68c65e2d1f6fbd1637736bafb9e 127.0.0.1:7002
+   slots:[10923-16383] (5461 slots) master
+S: 84dae996ae9f144539397c79e213d707953dc614 127.0.0.1:7003
+   replicates 2de72ccddcd0d68c65e2d1f6fbd1637736bafb9e
+S: 7aef0ac6cfea3ea9883d61d4f85e9013ee9e920c 127.0.0.1:7004
+   replicates 422f7a809e464bc9fab3ef535394e3eacf0f4a67
+S: bb071d1206a88c219a3e7de81fab1305ecdc81fe 127.0.0.1:7005
+   replicates 81c66987868397428ffde697e9f5b1cdf9989bc5
+   
+   这里把谁是主节点谁是从节点，每个主节点分配的槽都列的很清楚
+   
+
+redis-cli --cluster help 可以查看更多关于集群的命令  
+  
+==========================================
+
+原生命令在实际生产中几乎不会用到，因为太麻烦了。但是通过原生命令安装可以让我们清楚redis cluster的架构
+
+使用官方工具安装则简单高效，meet操作和槽分配都自动完成
+
+===========================================
+
+集群伸缩
+也就是在原有集群的基础上添加或者减少节点（扩容和缩容）
+
+其实集群伸缩的本质是槽(slot)和数据在节点之间的移动
+
+当增加节点的时候，每一个已有节点会分出一部分的槽和对应这部分槽的数据给新的节点。这就是集群伸缩的原理。
+
+扩容过程如下：
+1.启动两台新节点，一台主一台从
+2.让集群中的一台节点对这两台新节点进行meet操作
+3.每一个集群中的节点将槽和槽内所有的key迁移到新的主节点中
+
+缩容过程则反过来：
+1.迁移槽和数据
+2.让其他节点忘记该节点
+3.关闭这个节点
+
+
+试验如下
+在原有的集群基础上扩容
+127.0.0.1:7006
+127.0.0.1:7007
+
+成功扩容后再缩容
+
+1.配置和开启节点
+sed "s/7000/7006/g" redis-7000.conf > redis-7006.conf
+sed "s/7000/7007/g" redis-7000.conf > redis-7007.conf
+
+redis-server ./redis-7006.conf
+redis-server ./redis-7007.conf
+
+2.添加新节点到集群中
+# 添加新节点 7006
+redis-cli --cluster add-node 127.0.0.1:7006 127.0.0.1:7000 
+
+# 添加新节点7007，并且7007作为从节点同步7006 
+redis-cli --cluster add-node 127.0.0.1:7007 127.0.0.1:7000 --cluster-slave --cluster-master-id 355de703c2ebd01b1a5f4dff3cddf60c9d2f2db3
+
+add-node 最后要接一个原有集群的节点，作用是进行meet操作
+上面的操作已经对7006和7007进行了meet操作
+
+此时执行 
+redis-cli -p 7000 cluster nodes 
+查看节点信息，发现共有8个节点，4主4从，但是7006还未分配槽
+
+3.转移槽和数据到新的主节点
+在转移槽之前要计算好每个原有节点要迁移多少个槽到新节点。一般是平均分配。
+在这里3个主节点变成4个主节点，分给7006节点的槽的总数为：16384/4=4096，3个主节点每一个都要分4096/3个槽给7006
+
+redis-cli --cluster reshard 127.0.0.1:7006 
+
+# 接下来会进入槽迁移的引导程序
+>>> 4096    # 要迁移的槽总数
+>>> 355de703c2ebd01b1a5f4dff3cddf60c9d2f2db3    #要迁移给谁，这里填的是7006的node-id
+>>> all  # 表示槽的来源是全部的原有主节点
+
+
+查看集群中7006的状态
+redis-cli -p 7000 cluster nodes | grep 7006
+
+355de703c2ebd01b1a5f4dff3cddf60c9d2f2db3 127.0.0.1:7006@17006 master - 0 1583076616000 7 connected 0-1364 5461-6826 10923-12287
+
+可以看到7006节点已经成功分配槽
+
+
+# 进入进群客户端进行数据写入和查找
+redis-cli -c -p 7000    # -c表示集群客户端模式
+
+set name zbp
+-> Redirected to slot [5798] located at 127.0.0.1:7006      # 这个key写入了7006节点的5798号槽中,此时客户端已经切换到了7006客户端
+
+# 查看一个key所在的槽
+cluster keyslot name
+(integer) 5798
+
+
+在集群模式的客户端下，设置和获取key的过程会不断切换到不同子节点的客户端。
+
+
+4.缩容-转移槽和数据
+redis-cli --cluster reshard 127.0.0.1:7006 --cluster-from 355de703c2ebd01b1a5f4dff3cddf60c9d2f2db3 --cluster-to 81c66987868397428ffde697e9f5b1cdf9989bc5 --cluster-slots 1365
+
+redis-cli --cluster reshard 127.0.0.1:7006 --cluster-from 355de703c2ebd01b1a5f4dff3cddf60c9d2f2db3 --cluster-to 2de72ccddcd0d68c65e2d1f6fbd1637736bafb9e --cluster-slots 1366
+
+
+redis-cli --cluster reshard 127.0.0.1:7006 --cluster-from 355de703c2ebd01b1a5f4dff3cddf60c9d2f2db3 --cluster-to 2de72ccddcd0d68c65e2d1f6fbd1637736bafb9e --cluster-slots 1365
+
+上面分别将7006节点的槽迁移到 7000 7001 7002这三个主节点
+
+5.缩容-移除节点（要先移除从节点后移除主节点，否则会触发故障转移）
+# 下线从节点7007
+redis-cli --cluster del-node 127.0.0.1:7007 77c2a5b7a61919d7b25e3d35f7c966a273417d2f
+
+# 下线主节点7006
+redis-cli --cluster del-node 127.0.0.1:7000 355de703c2ebd01b1a5f4dff3cddf60c9d2f2db3 
+
+注意，如果主节点7006的槽没有清空是无法对它进行下线操作的
+
+上面所有的 redis-cli --cluster 操作中都有 ip:port 这个参数，这个参数可以填任何一个节点的 ip:port 它其实只是指定一个客户端来执行扩容缩容相关操作而已
+
+上面的命令无需死记，可以执行
+redis-cli --cluster help 
+
+查看帮助
+
+
+==========================================
+
+客户端路由
+
+针对集群，客户端要使用专门的连接方式。
+
+moved 重定向
+在客户端(如php,python)发送命令操作时,客户端会发送查询或写入key的命令给任意一个节点（但这个key不一定在这个节点中），该节点会计算这个key对应的槽和节点。
+如果计算出的节点就是当前节点就会执行命令（如返回key的值，或者写入key到这个节点中）（槽命中）
+如果计算出的节点不是当前节点，就会返回moved和槽位置和真正的目标节点给客户端。（槽不命中）
+客户端得到真正的目标节点后会再发一次请求到这个目标节点执行命令，这个一步需要额外在客户端写代码完成。
+
+例如：
+redis-cli -c -p 7000
+set hello world
+>>> OK      # 槽命中 
+
+set php best
+>>> Redirected to solt [9244] located at 127.0.0.1:7001 
+OK      #槽不命中 
+
+# 此时客户端自动跳转到 7001 客户端 
+# 我需要再执行一次 set php best 
+
+set php best 
+>>> OK  # 槽命中
+
+可以使用 cluster keyslot 键名 获取这个key对应的槽
+
+
+
+
+ask重定向
+ask重定向是在槽进行迁移的时候客户端发出key请求而没有命中节点时会发生的事情。
+
+slot迁移的过程是一个比较慢的过程，此时客户端发送查询一个key的请求给某节点，由于迁移，这个key转移到了别的节点中，此时该节点回复ask重定向，客户端发送一个Asking给目标节点，再发送查询命令给目标节点，目标节点返回响应。
+
+
+无论是moved还是ask重定向，都相当于访问了一次代理进行了一次转发，会导致操作效率降低。
+此时就出现了smart客户端
+
+
+smart客户端
+使用smart客户端就为了提高性能。
+其原理是：smart客户端会提前缓存槽和节点的对应关系，使得客户端发送请求之前就知道这个key对应的哪一个节点（key和slot的对应关系是公开的，在客户端使用hash算法取余即可得到，而slot和节点的对应关系也可以在缓存中得到，于是key和节点的对应关系就能得到），这个客户端会直接向这个节点发送请求，而不会产生moved或ask重定向。
+
+通过smart客户端，可以使得重定向变成直连，提高效率
+
+如果直连出错，就会走重定向，并且重新缓存slot和节点的关系。
+
+对于python,需要安装 redis-py-cluster 模块
+
+手册：https://readthedocs.org/projects/redis-py-cluster/
+
+下面是 redis-py-cluster 官方提供的用法
+from rediscluster import RedisCluster
+
+>>> # Requires at least one node for cluster discovery. Multiple nodes is recommended.
+>>> startup_nodes = [{"host": "127.0.0.1", "port": "7000"}]
+
+>>> rc = RedisCluster(startup_nodes=startup_nodes, decode_responses=True)
+
+>>> rc.set("foo", "bar")
+True
+>>> print(rc.get("foo"))
+'bar'
+
+
+就算没有官方提供的模块,我们也可以自己写一个智能客户端的类,将slot和节点的映射关系保存在缓存（如memcache）。这个映射关系不要写在文件中，否则每次要使用redis都要进行io操作会降低效率。
+
+这里要注意，redis服务器的配置文件中必须加上一句配置：
+protected-mode no
+
+否则，python在连接集群的时候会报错说存在保护模式无法连接成功。
+===============================================
+
+redis集群的故障转移
+
+A. 故障发现
+redis集群通过ping/pong消息实现故障发现（redis集群本身自己带有故障转移功能,不需要sentinel），分为主观下线和客观下线。
+
+主观下线：某个节点认为另一个节点不可用
+
+流程：
+节点A会通过定时任务1每隔一段时间发送ping消息给节点B，节点B接收成功后，会回复一个pong消息给节点A。
+节点A接收到pong消息后，会记录与节点B的最后通信时间。
+
+如果节点B挂掉，节点A也会发ping消息给节点B，只是节点B无法恢复pong消息。
+
+除此之外，还有另一个定时任务2，该定时任务会检查此时时间点距离与节点B的最后通信时间有多久，如果这个时间超过了node-timeout这个时间，那么节点1会对节点2标记pfail状态，即节点A认为节点B主观下线。
+
+
+
+客观下线：当半数以上持有槽的主节点（从节点不算）都标记某节点主观下线即为客观下线。
+
+此时，会通知集群内所有节点标记故障节点为客观下线状态；并且通知故障节点的从节点触发故障转移流程。
+
+
+B. 故障恢复
+从节点执行 slaveof no one 变为主节点
+系统执行 clusterDelSlot 撤销故障节点负责的槽，执行 clusterAddSlot 将这些槽分配给从节点
+该从节点向集群广播自己的pong消息，表明自己已经替换了故障节点。
+
+
+C. 故障转移
+现在在已经打开了6台节点（3主3从），并且已经分配好了槽的基础上:
+
+I. 查看一下任意一个主节点的pid
+
+cat redis_7000.pid      # 查看7000节点的pid
+或者
+ps -aux | grep redis
+
+
+II. 先写一个脚本往集群里面写入数据
+# coding=utf-8
+
+from rediscluster import RedisCluster
+from time import sleep
+
+startup_nodes = [{'host':"127.0.0.1", "port":7000}]
+rc = RedisCluster(startup_nodes=startup_nodes, decode_responses=True)
+
+print("连接成功")
+print(rc.connection_pool.nodes.nodes)
+
+with open('missed_key.txt', 'a') as f:
+    for i in range(100):
+        try:    # 默认写入redis
+            key = "test" + str(i)
+            rc.set(key, key)
+            print("Key：" + key + " has been saved")
+        except BaseException as e:  # 如果有节点宕机，则将key暂时写入文件
+            print(e)
+            f.write(key + "\n")
+            print("Key：" + key + " fail")
+
+        sleep(0.3)
+
+rc.close()  # 关闭连接
+
+III. 运行上面的python脚本，执行kill -9 pid，杀死7000这台主节点。
+
+结果如下：
+连接成功
+{'127.0.0.1:7005': {'host': '127.0.0.1', 'port': 7005, 'name': '127.0.0.1:7005', 'server_type': 'master'}, '127.0.0.1:7001': {'host': '127.0.0.1', 'port': 7001, 'name': '127.0.0.1:7001', 'server_type': 'slave'}, '127.0.0.1:7002': {'host': '127.0.0.1', 'port': 7002, 'name': '127.0.0.1:7002', 'server_type': 'master'}, '127.0.0.1:7003': {'host': '127.0.0.1', 'port': 7003, 'name': '127.0.0.1:7003', 'server_type': 'slave'}, '127.0.0.1:7004': {'host': '127.0.0.1', 'port': 7004, 'name': '127.0.0.1:7004', 'server_type': 'master'}, '127.0.0.1:7000': {'host': '127.0.0.1', 'port': 7000, 'name': '127.0.0.1:7000', 'server_type': 'slave'}}
+Key：test17 has been saved
+Key：test18 has been saved
+Key：test19 has been saved
+Key：test20 has been saved
+Key：test21 has been saved
+Key：test22 has been saved
+Key：test23 has been saved
+TTL exhausted.
+Key：test24 fail
+Key：test25 has been saved
+Key：test26 has been saved
+Key：test27 has been saved
+TTL exhausted.
+Key：test28 fail
+Key：test29 has been saved
+Key：test30 has been saved
+Key：test31 has been saved
+Key：test32 has been saved
+TTL exhausted.
+Key：test33 fail
+Key：test34 has been saved
+Key：test35 has been saved
+Key：test36 has been saved
+Key：test37 has been saved
+Key：test38 has been saved
+Key：test39 has been saved
+Key：test40 has been saved
+Key：test41 has been saved
+Key：test42 has been saved
+Key：test43 has been saved
+
+执行
+redis-cli -p 7001 cluster nodes
+观察各个节点的主从关系，发现7001从从节点变为主节点。
+
+
+================================
+
+redis集群常见问题
+
+1.集群完整性
+
+集群完整性是指这个参数：
+cluster-require-full-coverage 
+默认为yes，之前我设置的为no
+
+如果为yes，那么只要有1个节点发生故障，则整个集群都会被下线。此时往集群中写入数据的时候，会提示：
+
+(error) CLUSTERDOWN The cluster is down
+
+但是在现实中这是不能容忍的，所以一般设为no
+
+
+2.带宽消耗
+
+redis官方建议集群的节点数不要超过1000个，节点数越多，消耗的带宽会越多，因为集群在运行的过程中每台机器会不停的发送ping/pong消息给集群中的其他机器，这会带来不可忽视的带宽消耗（也就是说redis集群带宽的消耗是由于ping/pong消息的发送）。
+
+影响Redis集群的带宽消耗的因素：
+a.消息发送频率：节点发现与节点最后通信时间超过cluster-node-timeout/2时会直接发送ping消息（也就是说，任意的2台机器之间至多等cluster-node-timeout/2的时间就会发送一次ping/pong消息，所以控制cluster-node-timeout这个参数可以直接影响到带宽的消耗。而且节点数越多，每台机器发送消息的频率也会越高）。
+
+b.消息数据量：slots槽数组（2KB）和整个集群1/10的状态数据（10个节点状态数据约1KB）。所以集群节点数量越多，状态数据量也会越多。
+
+c.节点部署的机器规模：集群分布的机器越多且每台机器划分的节点数越均匀，则集群内整体的可用带宽越高。
+这里说的节点就是redis节点，机器就是机器，并不是一个节点就在一台机器上面。如果特定数量的节点放在越多的机器上，消耗的带宽越高。
+
+一个例子：
+当200个节点分布在20台机器（每台10个节点）
+
+cluster-node-timeout=15000, ping/pong带宽为25Mb
+
+cluster-node-timeout=20000, ping/pong带宽为15Mb
+
+
+按照我的理解：
+假如一台机器只放1个节点，且1/2个cluster-node-timeout时间内某一个节点要和集群内其他节点完成一次ping/pong，那么在这个时间内整个集群的发送消息的次数就是 n! 次（n阶乘次）。所以此时带宽消耗和节点数量的关系是接近呈指数增长的一个关系。
+
+
+优化：
+a. 避免“大”集群：就是说避免多业务使用一个集群，大业务可以使用多个集群（前提是这多个集群内的数据是没有关联的）
+b.cluster-node-timeout: 带宽和故障转移速度的均衡。这个参数调的越大，带宽消耗就越小，但是故障转移的时间（应该说是发现故障的时间）就越长。
+c.尽量将节点均匀分布到多台机器上：这样既保证了高可用（一台机器挂掉还有其他机器撑着），有保证了带宽消耗较少。
+
+
+
+3.Pub/Sub广播（发布订阅在集群中的问题）
+publish会在集群的每个节点广播，会严重消耗带宽
+解决方法：单独走一套 Redis Sentinel
+
+具体情况作者也没怎么说。
+
+
+4.数据倾斜和请求倾斜
+
+数据倾斜
+就是说集群中有的节点所存的数据量大，有的节点数据量少。
+
+出现数据倾斜有一下原因：
+a.节点和槽分配不均，有的节点分配的槽多，有的节点槽少。
+可以通过 
+redis-cli --cluster info ip:port 查看,它会列举出所有主节点的槽的情况
+
+通过
+redis-cli --cluster rebalance ip:port
+进行均衡，它会将16384个槽进行重新分配，但是这个命令要谨慎操作。
+
+b.不同槽所存的key数量差异较大，有的槽存的key多，有的槽存的key少
+CRC16的哈希算法下，分布会比较均匀的。如果出现这种情况可能是由于hash_tag的原因。
+可以通过 cluster countkeysinslot {slot} 获取槽对应key的个数
+
+c.包含bigkey，比如有的key存的是内容很大的hash
+可以通过在从节点执行命令 redis-cli --bigkey 发现bigkey
+
+d.内存相关配置不一致
+
+
+请求倾斜
+就是用户经常请求某个key，使得请求经常命中到某一个节点。
+
+优化：
+避免bigkey
+热点key不要用hash_tag
+当一致性要求不高时（就是redis中数据更新但是本地可以不那么及时的更新），可以用本地缓存 + MQ
+
+
+5.集群的读写分离
+集群模式的从节点不接受任何读写请求
+如果在从节点的客户端进行读取，它会重定向到主节点进行查询数据
+
+Redirected to slot [xxx] located at ip:port 
+
+如果想在集群中做读写分离会很复杂，成本非常高，宁愿将分布式的节点数增加也不要对集群进行读写分离。
+
+6.数据迁移
+使用
+redis-cli import ip:port --cluster-from ip:port --cluster-copy(或者 --cluster-replace)
+可以将数据从单机迁移到集群
+具体命令可以使用命令
+redis-cli --cluster help 
+查看
+
+也可以查查百度如何具体进行迁移
+
+集群迁移缺点如下：
+不支持在线迁移，如果你的redis服务还开着的情况下进行迁移，此时用户写入的新数据无法导入到集群中。
+单线程迁移，影响速度
+不支持断点续传
+
+
+集群 VS 单机
+key批量操作支持有限：如mget和mset所操作的key必须在一个slot中。
+不支持多数据库：集群模式下只有一个db
+复制只支持1层：不支持树形复制结构
+
+分布式redis不一定好，因为很多业务的QPS是达不到这么高的，也就是说很多业务不需要。而且redis分布式无法跨节点使用mget,keys,scan,flush,sinter这样的命令。跨节点也无法使用事务。智能客户端的维护也很复杂，要建立更多的连接池。
+
+所以很多情况下，redis sentinel + 一主多从的架构就已经足够好了，它是高可用的而且也有多个redis节点可以减轻读的压力，程序通过请求sentinel节点来对redis节点进行读写操作。
+
