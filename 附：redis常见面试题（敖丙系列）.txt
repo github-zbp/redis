@@ -1,0 +1,24 @@
+1.Redis有哪些数据结构
+字符串String、字典Hash、列表List、集合Set、有序集合Zset。
+
+除此之外还有：
+HyperLogLog，Pub/Sub发布订阅，布隆过滤器，Bitmap位图，Geo等
+（要能说出他们的使用场景和特点原理才行）
+
+String类型可以用于：普通的kv缓存，计数器（incr/decr），分布式锁(setex/setnx/watch/事务)，限流(incr/setex)
+
+hash类型可以用于缓存mysql中的行数据，一个hash key就mysql表中的一行数据。
+
+List类型可以用于：消息队列(lpush/brpop)
+
+Set类型可以用于：求交集并集差集，去重（利用不重复性），抽奖（无序性）
+
+Bitmap类型：实现大数据量的统计（能够节省大量内存）
+
+HyperLogLog类型：实质还是字符串，可以以极小的空间完成独立数据的统计。
+
+BloomFilter类型：实质还是一个位图类型，可用于在一个大数据集中准确的找到一个小数据集，具体应用有去重，防止缓存击穿。
+
+pub/sub类型：由一个生产者发布消息，多个消费者订阅频道后可以接受到消息，用于消息广播。
+
+2.
